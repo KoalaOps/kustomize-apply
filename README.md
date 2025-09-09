@@ -1,24 +1,32 @@
 # Kustomize Apply
 
-Applies kustomize overlays to Kubernetes clusters with optional wait and verification.
+Apply kustomize overlays to Kubernetes clusters with robust metadata extraction and precise workload tracking.
 
 ## Features
 
 - 🚀 **Direct apply** - kubectl apply with kustomize
-- ⏳ **Wait for rollout** - Optional deployment monitoring
+- ⏳ **Precise wait** - Only waits for workloads in your manifests
 - 📦 **Namespace management** - Auto-create namespaces
 - 🔍 **Dry run** - Preview changes before applying
-- 📊 **Status reporting** - Detailed deployment status
+- 🎯 **JSON outputs** - Structured data for downstream use
+- 🔐 **Self-contained** - Optional kubeconfig support
 
 ## Usage
 
 ```yaml
-- name: Deploy to cluster
+# Typical usage with kustomize-inspect
+- name: Inspect overlay
+  uses: KoalaOps/kustomize-inspect@v1
+  id: inspect
+  with:
+    overlay_dir: deploy/overlays/production
+
+- name: Apply to cluster
   uses: KoalaOps/kustomize-apply@v1
   with:
     overlay_dir: deploy/overlays/production
-    wait: true
-    wait_timeout: 300
+    namespace: ${{ steps.inspect.outputs.namespace }}
+    workloads_json: ${{ steps.inspect.outputs.workloads_json }}
 ```
 
 ## Inputs
@@ -26,50 +34,58 @@ Applies kustomize overlays to Kubernetes clusters with optional wait and verific
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `overlay_dir` | Path to kustomize overlay | ✅ | - |
-| `namespace` | Target namespace | ❌ | from overlay |
-| `dry_run` | Perform dry run only | ❌ | `false` |
-| `wait` | Wait for resources to be ready | ❌ | `true` |
+| `namespace` | Target namespace (from Inspect) | ✅ | - |
+| `workloads_json` | Workloads to track (from Inspect) | ❌ | `[]` |
+| `dry_run` | Server-side dry run only | ❌ | `false` |
+| `validate` | Client-side schema validation | ❌ | `true` |
+| `server_side` | Use Server-Side Apply | ❌ | `false` |
+| `wait` | Wait for workloads to be ready | ❌ | `true` |
 | `wait_timeout` | Wait timeout in seconds | ❌ | `300` |
-| `wait_for_jobs` | Wait for jobs to complete | ❌ | `false` |
-| `force` | Force apply (delete and recreate) | ❌ | `false` |
-| `server_side` | Use server-side apply | ❌ | `false` |
-| `validate` | Validate manifests against API schema | ❌ | `true` |
-| `prune` | Prune resources not in manifests | ❌ | `false` |
-| `prune_selector` | Label selector for pruning | ❌ | - |
 
 ## Outputs
 
-| Output | Description |
-|--------|-------------|
-| `applied_resources` | List of applied resources |
-| `namespace` | Namespace where resources were applied |
-| `deployment_name` | Primary deployment name (if found) |
+| Output | Description | Example |
+|--------|-------------|---------|
+| `applied_resources_json` | kubectl apply output as JSON | `["deployment.apps/api configured"]` |
 
 ## Examples
 
-### Basic deployment
+### Basic deployment with inspect
 ```yaml
-- name: Deploy application
+- name: Edit kustomization
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/staging
+    image: backend
+    tag: v1.2.3
+
+- name: Inspect changes
+  uses: KoalaOps/kustomize-inspect@v1
+  id: inspect
+  with:
+    overlay_dir: deploy/overlays/staging
+
+- name: Apply to cluster
   uses: KoalaOps/kustomize-apply@v1
   with:
     overlay_dir: deploy/overlays/staging
-```
-
-### With specific namespace
-```yaml
-- name: Deploy to namespace
-  uses: KoalaOps/kustomize-apply@v1
-  with:
-    overlay_dir: deploy/overlays/dev
-    namespace: development
+    namespace: ${{ steps.inspect.outputs.namespace }}
+    workloads_json: ${{ steps.inspect.outputs.workloads_json }}
 ```
 
 ### Dry run first
 ```yaml
+- name: Inspect
+  uses: KoalaOps/kustomize-inspect@v1
+  id: inspect
+  with:
+    overlay_dir: deploy/overlays/production
+
 - name: Preview changes
   uses: KoalaOps/kustomize-apply@v1
   with:
     overlay_dir: deploy/overlays/production
+    namespace: ${{ steps.inspect.outputs.namespace }}
     dry_run: true
 
 - name: Apply if approved
@@ -77,26 +93,28 @@ Applies kustomize overlays to Kubernetes clusters with optional wait and verific
   uses: KoalaOps/kustomize-apply@v1
   with:
     overlay_dir: deploy/overlays/production
+    namespace: ${{ steps.inspect.outputs.namespace }}
+    workloads_json: ${{ steps.inspect.outputs.workloads_json }}
 ```
 
 ### No wait (fire and forget)
 ```yaml
-- name: Quick deploy
+- name: Quick apply
   uses: KoalaOps/kustomize-apply@v1
   with:
     overlay_dir: deploy/overlays/dev
+    namespace: development
     wait: false
 ```
 
-
-### With pruning
+### Server-side apply
 ```yaml
-- name: Deploy with cleanup
+- name: Apply with SSA
   uses: KoalaOps/kustomize-apply@v1
   with:
-    overlay_dir: deploy/overlays/staging
-    prune: true
-    prune_selector: app=myapp,env=staging
+    overlay_dir: deploy/overlays/production
+    namespace: ${{ steps.inspect.outputs.namespace }}
+    server_side: true
 ```
 
 ## Complete Workflow Example
@@ -115,54 +133,58 @@ jobs:
           region: us-east-1
           cluster: production
       
-      - name: Update image
+      - name: Update kustomization
         uses: KoalaOps/kustomize-edit@v1
         with:
           overlay_dir: deploy/overlays/production
           image: backend
-          new_tag: ${{ inputs.tag }}
+          tag: ${{ inputs.tag }}
+          annotations: |
+            deployed-by:${{ github.actor }}
+            deployment-id:${{ github.run_id }}
+      
+      - name: Inspect changes
+        uses: KoalaOps/kustomize-inspect@v1
+        id: inspect
+        with:
+          overlay_dir: deploy/overlays/production
       
       - name: Apply to cluster
         uses: KoalaOps/kustomize-apply@v1
-        id: deploy
         with:
           overlay_dir: deploy/overlays/production
+          namespace: ${{ steps.inspect.outputs.namespace }}
+          workloads_json: ${{ steps.inspect.outputs.workloads_json }}
           wait: true
           wait_timeout: 300
       
-      - name: Show status
+      - name: Show deployment info
         run: |
-          echo "Deployed to: ${{ steps.deploy.outputs.namespace }}"
-          echo "Deployment: ${{ steps.deploy.outputs.deployment_name }}"
+          echo "Deployed to namespace: ${{ steps.inspect.outputs.namespace }}"
+          echo "Primary deployment: ${{ steps.inspect.outputs.primary_deployment }}"
 ```
 
-## Resource Detection
+## How It Works
 
-The action automatically detects what to wait for:
+1. **Builds** manifests using `kustomize build`
+2. **Validates** against kubectl schema (optional)
+3. **Ensures** namespace exists
+4. **Applies** manifests to cluster
+5. **Waits** only for workloads provided via `workloads_json`
 
-1. **Deployments** - Waits for rollout to complete
-2. **StatefulSets** - Waits for all pods ready
-3. **DaemonSets** - Waits for desired number scheduled
-4. **Jobs** - Waits for completion
-5. **Services** - Waits for endpoints
-
-## Error Handling
-
-The action will fail if:
-- Kustomize build fails
-- kubectl apply fails
-- Resources don't become ready within timeout
+The action uses robust YAML parsing with `yq` to precisely track only the workloads in your manifests, avoiding brittle grep-based extraction.
 
 ## Prerequisites
 
-- kubectl configured with cluster access
+- `kubectl` configured with cluster access
+- `kustomize` available
+- `jq` for JSON processing
 - Appropriate RBAC permissions
-- kustomize available (or kubectl 1.14+)
 
 ## Notes
 
-- Use with cloud-login for authentication
-- Supports kubectl 1.14+ (built-in kustomize)
-- Respects resource ordering
-- Handles CRDs correctly
-- Works with Helm-generated manifests
+- Designed to work with kustomize-inspect for metadata
+- No force or prune options (by design)
+- Waits only for workloads you're actually deploying
+- Works with any valid kustomization
+- Supports server-side apply for large manifests
