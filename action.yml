@@ -1,0 +1,235 @@
+name: 'Kustomize Apply'
+description: 'Build kustomize overlay and apply to Kubernetes cluster with optional wait'
+author: 'KoalaOps'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'purple'
+
+inputs:
+  overlay_dir:
+    description: 'Path to kustomize overlay directory'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace (creates if not exists)'
+    required: false
+  dry_run:
+    description: 'Perform dry run only'
+    required: false
+    default: 'false'
+  wait:
+    description: 'Wait for resources to be ready'
+    required: false
+    default: 'true'
+  wait_timeout:
+    description: 'Wait timeout in seconds'
+    required: false
+    default: '300'
+  wait_for_jobs:
+    description: 'Wait for jobs to complete'
+    required: false
+    default: 'false'
+  prune:
+    description: 'Prune resources not in kustomization'
+    required: false
+    default: 'false'
+  prune_selector:
+    description: 'Label selector for pruning'
+    required: false
+  force:
+    description: 'Force apply (delete and recreate if needed)'
+    required: false
+    default: 'false'
+  server_side:
+    description: 'Use server-side apply'
+    required: false
+    default: 'false'
+  validate:
+    description: 'Validate manifests against API schema'
+    required: false
+    default: 'true'
+
+outputs:
+  applied_resources:
+    description: 'List of applied resources'
+    value: ${{ steps.apply.outputs.resources }}
+  namespace:
+    description: 'Namespace where resources were applied'
+    value: ${{ steps.apply.outputs.namespace }}
+  deployment_name:
+    description: 'Primary deployment name (if found)'
+    value: ${{ steps.apply.outputs.deployment }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build kustomization
+      id: build
+      shell: bash
+      run: |
+        echo "🔨 Building kustomization from: ${{ inputs.overlay_dir }}"
+        
+        if [ ! -d "${{ inputs.overlay_dir }}" ]; then
+          echo "::error::Overlay directory not found: ${{ inputs.overlay_dir }}"
+          exit 1
+        fi
+        
+        # Build and save manifests
+        kustomize build "${{ inputs.overlay_dir }}" > /tmp/manifests.yaml
+        
+        # Extract namespace if not provided
+        if [ -z "${{ inputs.namespace }}" ]; then
+          NAMESPACE=$(grep -m1 "^  namespace:" /tmp/manifests.yaml | awk '{print $2}' || echo "default")
+          echo "Detected namespace: $NAMESPACE"
+        else
+          NAMESPACE="${{ inputs.namespace }}"
+        fi
+        echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+        
+        # Count resources
+        RESOURCE_COUNT=$(grep -c "^---" /tmp/manifests.yaml || echo "1")
+        echo "📦 Built $RESOURCE_COUNT resources"
+        
+        # Extract primary deployment name
+        DEPLOYMENT=$(grep -A1 "kind: Deployment" /tmp/manifests.yaml | grep "name:" | head -1 | awk '{print $2}' || echo "")
+        if [ -n "$DEPLOYMENT" ]; then
+          echo "Found deployment: $DEPLOYMENT"
+          echo "deployment=$DEPLOYMENT" >> $GITHUB_OUTPUT
+        fi
+        
+        # List resources
+        echo "📋 Resources to apply:"
+        grep -E "^kind:|^  name:" /tmp/manifests.yaml | paste - - | sed 's/kind: //g' | sed 's/  name: / \/ /g' | sed 's/^/  - /'
+    
+    - name: Validate manifests
+      if: inputs.validate == 'true' && inputs.dry_run != 'true'
+      shell: bash
+      run: |
+        echo "✅ Validating manifests..."
+        kubectl apply --validate=true --dry-run=client -f /tmp/manifests.yaml
+        echo "✅ Manifests are valid"
+    
+    - name: Create namespace
+      if: inputs.dry_run != 'true'
+      shell: bash
+      run: |
+        NAMESPACE="${{ steps.build.outputs.namespace }}"
+        echo "📁 Ensuring namespace exists: $NAMESPACE"
+        kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    
+    - name: Apply manifests
+      id: apply
+      shell: bash
+      run: |
+        NAMESPACE="${{ steps.build.outputs.namespace }}"
+        echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+        echo "deployment=${{ steps.build.outputs.deployment }}" >> $GITHUB_OUTPUT
+        
+        # Build kubectl apply command
+        APPLY_CMD="kubectl apply -f /tmp/manifests.yaml"
+        
+        if [ -n "$NAMESPACE" ]; then
+          APPLY_CMD="$APPLY_CMD -n $NAMESPACE"
+        fi
+        
+        if [ "${{ inputs.server_side }}" == "true" ]; then
+          APPLY_CMD="$APPLY_CMD --server-side"
+        fi
+        
+        if [ "${{ inputs.force }}" == "true" ]; then
+          APPLY_CMD="$APPLY_CMD --force"
+        fi
+        
+        if [ "${{ inputs.prune }}" == "true" ]; then
+          APPLY_CMD="$APPLY_CMD --prune"
+          if [ -n "${{ inputs.prune_selector }}" ]; then
+            APPLY_CMD="$APPLY_CMD -l ${{ inputs.prune_selector }}"
+          fi
+        fi
+        
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "🔍 Performing dry run..."
+          APPLY_CMD="$APPLY_CMD --dry-run=server"
+        else
+          echo "🚀 Applying manifests..."
+        fi
+        
+        # Apply and capture output
+        $APPLY_CMD | tee /tmp/apply_output.txt
+        
+        # Extract applied resources
+        RESOURCES=$(grep -E "created|configured|unchanged" /tmp/apply_output.txt | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
+        echo "resources=$RESOURCES" >> $GITHUB_OUTPUT
+        
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "✅ Dry run completed successfully"
+        else
+          echo "✅ Manifests applied successfully"
+        fi
+    
+    - name: Wait for rollout
+      if: inputs.wait == 'true' && inputs.dry_run != 'true'
+      shell: bash
+      run: |
+        NAMESPACE="${{ steps.build.outputs.namespace }}"
+        DEPLOYMENT="${{ steps.build.outputs.deployment }}"
+        TIMEOUT="${{ inputs.wait_timeout }}"
+        
+        echo "⏳ Waiting for resources to be ready (timeout: ${TIMEOUT}s)..."
+        
+        # Wait for deployments
+        if [ -n "$DEPLOYMENT" ]; then
+          echo "Waiting for deployment: $DEPLOYMENT"
+          if kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE" --timeout="${TIMEOUT}s"; then
+            echo "✅ Deployment $DEPLOYMENT is ready"
+          else
+            echo "::error::Deployment $DEPLOYMENT failed to become ready within ${TIMEOUT}s"
+            kubectl describe deployment "$DEPLOYMENT" -n "$NAMESPACE" | tail -20
+            exit 1
+          fi
+        fi
+        
+        # Wait for all deployments in namespace
+        echo "Checking all deployments in namespace $NAMESPACE..."
+        kubectl get deployments -n "$NAMESPACE" --no-headers | while read -r name _; do
+          echo "  - Waiting for deployment: $name"
+          kubectl rollout status deployment/"$name" -n "$NAMESPACE" --timeout="${TIMEOUT}s" || true
+        done
+        
+        # Wait for statefulsets
+        kubectl get statefulsets -n "$NAMESPACE" --no-headers 2>/dev/null | while read -r name _; do
+          echo "  - Waiting for statefulset: $name"
+          kubectl rollout status statefulset/"$name" -n "$NAMESPACE" --timeout="${TIMEOUT}s" || true
+        done
+        
+        # Wait for daemonsets
+        kubectl get daemonsets -n "$NAMESPACE" --no-headers 2>/dev/null | while read -r name _; do
+          echo "  - Waiting for daemonset: $name"
+          kubectl rollout status daemonset/"$name" -n "$NAMESPACE" --timeout="${TIMEOUT}s" || true
+        done
+        
+        # Wait for jobs if requested
+        if [ "${{ inputs.wait_for_jobs }}" == "true" ]; then
+          kubectl get jobs -n "$NAMESPACE" --no-headers 2>/dev/null | while read -r name _; do
+            echo "  - Waiting for job: $name"
+            kubectl wait --for=condition=complete job/"$name" -n "$NAMESPACE" --timeout="${TIMEOUT}s" || true
+          done
+        fi
+        
+        echo "✅ All resources are ready"
+    
+    - name: Show status
+      if: inputs.dry_run != 'true'
+      shell: bash
+      run: |
+        NAMESPACE="${{ steps.build.outputs.namespace }}"
+        echo "📊 Resource status in namespace: $NAMESPACE"
+        echo ""
+        echo "Deployments:"
+        kubectl get deployments -n "$NAMESPACE" 2>/dev/null || echo "  None"
+        echo ""
+        echo "Pods:"
+        kubectl get pods -n "$NAMESPACE" 2>/dev/null || echo "  None"
+        echo ""
+        echo "Services:"
+        kubectl get services -n "$NAMESPACE" 2>/dev/null || echo "  None"
